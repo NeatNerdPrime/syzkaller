@@ -7,29 +7,22 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/email"
+
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
+	"github.com/google/syzkaller/syz-cluster/pkg/emailclient"
 	"github.com/google/syzkaller/syz-cluster/pkg/report"
 )
-
-type EmailToSend struct {
-	To        []string
-	Cc        []string
-	Subject   string
-	InReplyTo string
-	Body      []byte
-}
-
-type SendEmailCb func(context.Context, *EmailToSend) (string, error)
 
 type Handler struct {
 	reporter    string
 	apiClient   *api.ReporterClient
 	emailConfig *app.EmailConfig
-	sender      SendEmailCb
+	sender      emailclient.Sender
 }
 
 func (h *Handler) PollReportsLoop(ctx context.Context, pollPeriod time.Duration) {
@@ -76,31 +69,41 @@ func (h *Handler) report(ctx context.Context, rep *api.SessionReport) error {
 		// This should never be happening..
 		return fmt.Errorf("failed to render the template: %w", err)
 	}
-	toSend := &EmailToSend{
+	toSend := &emailclient.Email{
 		Subject: "Re: " + rep.Series.Title, // TODO: use the original rather than the stripped title.
 		To:      rep.Cc,
 		Body:    body,
+		Cc:      []string{h.emailConfig.ArchiveList},
+		BugID:   rep.ID,
 	}
 	if rep.Moderation {
 		toSend.To = []string{h.emailConfig.ModerationList}
+		toSend.Subject = "[moderation/CI] " + toSend.Subject
 	} else {
+		if h.emailConfig.Name != "" {
+			toSend.Subject = fmt.Sprintf("[%s] %s", h.emailConfig.Name, toSend.Subject)
+		}
 		// We assume that email reporting is used for series received over emails.
 		toSend.InReplyTo = rep.Series.ExtID
 		toSend.To = rep.Cc
-		toSend.Cc = []string{h.emailConfig.ArchiveList}
 	}
 	msgID, err := h.sender(ctx, toSend)
 	if err != nil {
 		return fmt.Errorf("failed to send: %w", err)
 	}
-
-	// Now that the report is sent, update the link to the email discussion.
-	err = h.apiClient.UpdateReport(ctx, rep.ID, &api.UpdateReportReq{
-		// TODO: for Lore emails, set Link = lore.Link(msgID).
-		MessageID: msgID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to update: %w", err)
+	// Senders may not always know the MessageID of the newly sent messages (that's the case of dashapi).
+	if msgID != "" {
+		// Record MessageID so that we could later trace user replies back to it.
+		_, err = h.apiClient.RecordReply(ctx, &api.RecordReplyReq{
+			// TODO: for Lore emails, set Link = lore.Link(msgID).
+			MessageID: msgID,
+			Time:      time.Now(),
+			ReportID:  rep.ID,
+			Reporter:  h.reporter,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to record the reply: %w", err)
+		}
 	}
 	return nil
 }
@@ -109,6 +112,10 @@ func (h *Handler) report(ctx context.Context, rep *api.SessionReport) error {
 func (h *Handler) IncomingEmail(ctx context.Context, msg *email.Email) error {
 	if len(msg.BugIDs) == 0 {
 		// Unrelated email.
+		return nil
+	}
+	if msg.OwnEmail && !strings.HasPrefix(msg.Subject, email.ForwardedPrefix) {
+		// We normally ignore our own emails, with the exception of the emails forwarded from the dashboard.
 		return nil
 	}
 	reportID := msg.BugIDs[0]
@@ -133,7 +140,7 @@ func (h *Handler) IncomingEmail(ctx context.Context, msg *email.Email) error {
 	if reply == "" {
 		return nil
 	}
-	_, err := h.sender(ctx, &EmailToSend{
+	_, err := h.sender(ctx, &emailclient.Email{
 		To:        []string{msg.Author},
 		Cc:        msg.Cc,
 		Subject:   "Re: " + msg.Subject,

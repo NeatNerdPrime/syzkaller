@@ -29,16 +29,27 @@ func TestEmailStream(t *testing.T) {
 	err = reporterClient.ConfirmReport(ctx, report.ID)
 	assert.NoError(t, err)
 	const messageID = "<message-id>"
-	err = reporterClient.UpdateReport(ctx, report.ID, &api.UpdateReportReq{
+	_, err = reporterClient.RecordReply(ctx, &api.RecordReplyReq{
 		MessageID: messageID,
+		ReportID:  report.ID,
+		Reporter:  api.LKMLReporter,
 	})
 	assert.NoError(t, err)
 
 	// Emulate the lore archive and set up the loop.
 	loreArchive := newLoreArchive(t)
 	writeTo := make(chan *email.Email, 16)
-	stream := NewLKMLEmailStream(t.TempDir(), loreArchive.remoteRef(), reporterClient, writeTo)
-
+	emailCfg := &app.EmailConfig{
+		LoreArchiveURL: loreArchive.remoteRef(),
+		SMTP: &app.SMTPConfig{
+			From: `syzbot@syzkaller.appspotmail.com`,
+		},
+		Dashapi: &app.DashapiConfig{
+			From:          "bot@syzbot.org",
+			ContextPrefix: "ci_",
+		},
+	}
+	stream := NewLKMLEmailStream(t.TempDir(), reporterClient, emailCfg, writeTo)
 	cancel := startStreamLoop(t, ctx, stream)
 
 	t.Logf("sending a direct reply")
@@ -77,11 +88,48 @@ Content-Type: text/plain
 	msg = <-writeTo
 	assert.Len(t, msg.BugIDs, 0)
 
+	t.Logf("identify by email context")
+	loreArchive.saveMessage(t, `Date: Sun, 7 May 2017 19:55:00 -0700
+Subject: New thread
+Message-ID: <new-thread>
+In-Reply-To: <whatever>
+From: Someone Else <b@syzbot.org>
+Cc: <bot+ci_`+report.ID+`@syzbot.org>
+Content-Type: text/plain
+
+`)
+	msg = <-writeTo
+	assert.Equal(t, []string{report.ID}, msg.BugIDs)
+
+	t.Logf("own email (SMTP)")
+	loreArchive.saveMessage(t, `Date: Sun, 7 May 2017 19:55:00 -0700
+Subject: New thread
+Message-ID: <new-thread>
+In-Reply-To: <whatever>
+From: Ourselves <`+emailCfg.SMTP.From+`>
+Content-Type: text/plain
+
+`)
+	msg = <-writeTo
+	assert.True(t, msg.OwnEmail)
+
+	t.Logf("own email (dashapi)")
+	loreArchive.saveMessage(t, `Date: Sun, 7 May 2017 19:55:00 -0700
+Subject: New thread
+Message-ID: <new-thread>
+In-Reply-To: <whatever>
+From: Ourselves <`+emailCfg.Dashapi.From+`>
+Content-Type: text/plain
+
+`)
+	msg = <-writeTo
+	assert.True(t, msg.OwnEmail)
+
 	t.Logf("stopping the loop")
 	cancel()
 
 	// Emulate service restart.
-	stream = NewLKMLEmailStream(t.TempDir(), loreArchive.remoteRef(), reporterClient, writeTo)
+	stream = NewLKMLEmailStream(t.TempDir(), reporterClient, emailCfg, writeTo)
 	cancel = startStreamLoop(t, ctx, stream)
 	defer cancel()
 	// Only the unrelated message is expected to pop up.

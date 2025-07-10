@@ -11,9 +11,12 @@ import (
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/controller"
+	"github.com/google/syzkaller/syz-cluster/pkg/emailclient"
 	"github.com/google/syzkaller/syz-cluster/pkg/reporter"
 	"github.com/stretchr/testify/assert"
 )
+
+var testEmailConfig = emailclient.TestEmailConfig()
 
 func TestModerationReportFlow(t *testing.T) {
 	env, ctx := app.TestEnvironment(t)
@@ -26,9 +29,11 @@ func TestModerationReportFlow(t *testing.T) {
 	receivedEmail := emailServer.email()
 	assert.NotNil(t, receivedEmail, "a moderation email must be sent")
 	receivedEmail.Body = nil // for now don't validate the body
-	assert.Equal(t, &EmailToSend{
+	assert.Equal(t, &emailclient.Email{
 		To:      []string{testEmailConfig.ModerationList},
-		Subject: "Re: " + testSeries.Title,
+		Cc:      []string{testEmailConfig.ArchiveList},
+		Subject: "[moderation/CI] Re: " + testSeries.Title,
+		BugID:   report.ID,
 		// Note that InReplyTo and Cc are nil.
 	}, receivedEmail)
 
@@ -44,17 +49,18 @@ func TestModerationReportFlow(t *testing.T) {
 	assert.NoError(t, err)
 
 	// The report must be sent upstream.
-	_, err = handler.PollAndReport(ctx)
+	report, err = handler.PollAndReport(ctx)
 	assert.NoError(t, err)
 
 	receivedEmail = emailServer.email()
 	assert.NotNil(t, receivedEmail, "an email must be sent upstream")
 	receivedEmail.Body = nil
-	assert.Equal(t, &EmailToSend{
+	assert.Equal(t, &emailclient.Email{
 		To:        testSeries.Cc,
 		Cc:        []string{testEmailConfig.ArchiveList},
-		Subject:   "Re: " + testSeries.Title,
+		Subject:   "[name] Re: " + testSeries.Title,
 		InReplyTo: testSeries.ExtID,
+		BugID:     report.ID,
 	}, receivedEmail)
 }
 
@@ -102,7 +108,7 @@ func TestInvalidReply(t *testing.T) {
 		assert.NoError(t, err)
 		reply := emailServer.email()
 		assert.NotNil(t, reply)
-		assert.Equal(t, &EmailToSend{
+		assert.Equal(t, &emailclient.Email{
 			To:        []string{"user@email.com"},
 			Cc:        []string{"a@a.com", "b@b.com"},
 			Subject:   "Re: Command",
@@ -113,6 +119,40 @@ Unknown command
 
 `),
 		}, reply)
+	})
+
+	t.Run("own email", func(t *testing.T) {
+		err = handler.IncomingEmail(ctx, &email.Email{
+			OwnEmail: true,
+			BugIDs:   []string{report.ID},
+			Commands: []*email.SingleCommand{
+				{
+					Command: email.CmdUpstream,
+				},
+			},
+		})
+		assert.NoError(t, err)
+		_, err = handler.PollAndReport(ctx)
+		assert.NoError(t, err)
+		// No email must be sent in reply.
+		assert.Nil(t, emailServer.email())
+	})
+
+	t.Run("forwarded email", func(t *testing.T) {
+		err = handler.IncomingEmail(ctx, &email.Email{
+			Subject:  email.ForwardedPrefix + "abcd",
+			OwnEmail: true,
+			BugIDs:   []string{report.ID},
+			Commands: []*email.SingleCommand{
+				{
+					Command: email.CmdUpstream,
+				},
+			},
+		})
+		assert.NoError(t, err)
+		_, err = handler.PollAndReport(ctx)
+		assert.NoError(t, err)
+		assert.NotNil(t, emailServer.email())
 	})
 }
 
@@ -137,33 +177,25 @@ func setupHandlerTest(t *testing.T, env *app.AppEnvironment, ctx context.Context
 }
 
 type fakeSender struct {
-	ch chan *EmailToSend
+	ch chan *emailclient.Email
 }
 
 func makeFakeSender() *fakeSender {
 	return &fakeSender{
-		ch: make(chan *EmailToSend, 16),
+		ch: make(chan *emailclient.Email, 16),
 	}
 }
 
-func (f *fakeSender) send(ctx context.Context, e *EmailToSend) (string, error) {
+func (f *fakeSender) send(ctx context.Context, e *emailclient.Email) (string, error) {
 	f.ch <- e
 	return "email-id", nil
 }
 
-func (f *fakeSender) email() *EmailToSend {
+func (f *fakeSender) email() *emailclient.Email {
 	select {
 	case e := <-f.ch:
 		return e
 	default:
 		return nil
 	}
-}
-
-var testEmailConfig = &app.EmailConfig{
-	Name:           "name",
-	DocsLink:       "docs",
-	Sender:         "a@b.com",
-	ModerationList: "moderation@list.com",
-	ArchiveList:    "archive@list.com",
 }
