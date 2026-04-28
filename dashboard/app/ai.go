@@ -766,6 +766,7 @@ func apiAIJobPoll(ctx context.Context, req *dashapi.AIJobPollReq) (any, error) {
 			textErr = err
 		}
 		if id == 0 {
+			args[name] = ""
 			return
 		}
 		data, _, err := getText(ctx, tag, id)
